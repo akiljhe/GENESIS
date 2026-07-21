@@ -1,0 +1,35 @@
+# Datasets and generated images
+capsule/
+carpet/
+casting_512x512/
+grid/
+hazelnut/
+leather/
+metal_nut/
+pill/
+screw/
+tile/
+toothbrush/
+transistor/
+wood/
+zipper/
+hasil_gambar/
+
+# Archives
+*.zip
+*.tar.xz
+*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Mac
+.DS_Store
+
+# IDE and Agents
+.agents/
+.claude/
+.vscode/
