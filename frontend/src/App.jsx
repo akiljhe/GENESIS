@@ -1,4 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { checkHealth, createGenerateJob, fetchJobs, fetchModels, getImageUrl, getJobStatus, uploadImage } from './services/api';
+
+const ITEMS_PER_PAGE = 12;
 
 const defaultImage = '';
 
@@ -62,8 +65,6 @@ const translations = {
     stageFinal: 'Final',
     stageCurrent: 'Current',
     stageRefined: 'Refined',
-    viewHeatmap: 'View Heatmap',
-    toggleLabels: 'Toggle Labels',
     labels: 'Labels',
     on: 'ON',
     off: 'OFF',
@@ -167,8 +168,6 @@ const translations = {
     stageFinal: 'Akhir',
     stageCurrent: 'Saat Ini',
     stageRefined: 'Disempurnakan',
-    viewHeatmap: 'Lihat Heatmap',
-    toggleLabels: 'Alihkan Label',
     labels: 'Label',
     on: 'AKTIF',
     off: 'NONAKTIF',
@@ -324,18 +323,24 @@ export default function App() {
   const [language, setLanguage] = useState('id');
   const t = translations[language];
 
-  const [selectedModel, setSelectedModel] = useState('Detect mistake');
+  const [backendConnected, setBackendConnected] = useState(false);
+  const [modelList, setModelList] = useState([]);
+  const [selectedModel, setSelectedModel] = useState('');
   const [selectedDefect, setSelectedDefect] = useState('Goresan (Scratch)');
   const [epoch, setEpoch] = useState(49);
   const [targetImages, setTargetImages] = useState('1,000');
   const [showLabels, setShowLabels] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [generated, setGenerated] = useState(1000);
+  const [generated, setGenerated] = useState(0);
+  const [generatedImages, setGeneratedImages] = useState([]);
   const [format, setFormat] = useState('YOLO (.txt)');
   const [normalFiles, setNormalFiles] = useState([]);
   const [defectFiles, setDefectFiles] = useState([]);
   const [selectedResult, setSelectedResult] = useState(0);
+  const [resultPage, setResultPage] = useState(0);
   const [status, setStatus] = useState({ key: 'ready' });
+  const [isExporting, setIsExporting] = useState(false);
+  const [lastUploadId, setLastUploadId] = useState(null);
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [autoSave, setAutoSave] = useState(true);
@@ -343,12 +348,11 @@ export default function App() {
   const [defaultQuality, setDefaultQuality] = useState('High');
   const [defaultEpoch, setDefaultEpoch] = useState(49);
   const [defaultFormat, setDefaultFormat] = useState('YOLO (.txt)');
-  const [apiEndpoint, setApiEndpoint] = useState('factory-ai.local/api/v1');
+  const [apiEndpoint, setApiEndpoint] = useState('localhost:8000');
   const [gpuMode, setGpuMode] = useState('Auto Select');
 
   const normalInputRef = useRef(null);
   const defectInputRef = useRef(null);
-
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDark);
@@ -358,6 +362,26 @@ export default function App() {
     document.documentElement.lang = language;
   }, [language]);
 
+  useEffect(() => {
+    const init = async () => {
+      const health = await checkHealth();
+      setBackendConnected(!!health);
+      const models = await fetchModels();
+      setModelList(models);
+      if (models.length > 0 && !selectedModel) setSelectedModel(models[0]);
+      const jobs = await fetchJobs();
+      const completed = jobs.filter(j => j.status === 'completed' && j.output_image_path);
+      setGeneratedImages(completed.map(j => ({ id: j.id, image: getImageUrl(j.output_image_path), model: j.model_name })));
+      setGenerated(completed.length);
+    };
+    init();
+    const interval = setInterval(async () => {
+      const health = await checkHealth();
+      setBackendConnected(!!health);
+    }, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
   const currentDefect = useMemo(
     () => defects.find((item) => item.value === selectedDefect) || defects[0],
     [selectedDefect]
@@ -366,24 +390,108 @@ export default function App() {
   const previewImage = normalFiles[0] ? URL.createObjectURL(normalFiles[0]) : defaultImage;
   const message = resolveMessage(status, t);
 
-  const handleGenerate = () => {
+  const handleUpload = useCallback(async (files) => {
+    setNormalFiles(files);
+    if (files.length > 0) {
+      try {
+        const result = await uploadImage(files[0]);
+        setLastUploadId(result.image.id);
+      } catch { /* upload optional */ }
+    }
+  }, []);
+
+  const handleGenerate = async () => {
+    if (!selectedModel || !backendConnected) return;
     setIsGenerating(true);
     setStatus({ key: 'generating' });
-    window.setTimeout(() => {
+    try {
+      const result = await createGenerateJob(selectedModel, lastUploadId);
+      const jobId = result.job.id;
+      for (let i = 0; i < 120; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const data = await getJobStatus(jobId);
+        const job = data.job;
+        if (job.status === 'completed') {
+          const newImg = { id: job.id, image: getImageUrl(job.output_image_path), model: job.model_name };
+          setGeneratedImages(prev => [newImg, ...prev]);
+          setGenerated(prev => prev + 1);
+          setStatus({ key: 'generated', count: generated + 1 });
+          break;
+        } else if (job.status === 'failed') {
+          setStatus({ key: 'ready' });
+          break;
+        }
+      }
+    } catch {
+      setStatus({ key: 'ready' });
+    } finally {
       setIsGenerating(false);
-      const value = Number(String(targetImages).replace(/,/g, '')) || 1000;
-      setGenerated(value);
-      setStatus({ key: 'generated', count: value });
-    }, 1400);
+    }
   };
 
-  const handleExport = () => {
-    setStatus({ key: 'exported', format, count: generated });
+  const handleExport = async () => {
+    if (generatedImages.length === 0) {
+      setStatus({ key: 'ready' });
+      return;
+    }
+    setIsExporting(true);
+    setStatus({ key: 'generating' });
+    try {
+      const JSZip = (await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm')).default;
+      const zip = new JSZip();
+      const imgFolder = zip.folder('images');
+      const annotations = [];
+
+      for (let i = 0; i < generatedImages.length; i++) {
+        try {
+          const resp = await fetch(generatedImages[i].image);
+          const blob = await resp.blob();
+          const filename = `gen_${generatedImages[i].id}_${generatedImages[i].model || 'unknown'}.png`;
+          imgFolder.file(filename, blob);
+          annotations.push({ id: i + 1, file: filename, model: generatedImages[i].model || 'unknown', format });
+        } catch { /* skip failed images */ }
+      }
+
+      if (format === 'COCO (.json)') {
+        const coco = { images: annotations.map((a, idx) => ({ id: idx + 1, file_name: a.file })), annotations: [], categories: [{ id: 1, name: 'defect' }] };
+        zip.file('annotations.json', JSON.stringify(coco, null, 2));
+      } else if (format === 'Pascal VOC (.xml)') {
+        annotations.forEach(a => {
+          zip.file(a.file.replace('.png', '.xml'), `<annotation><filename>${a.file}</filename><object><name>defect</name></object></annotation>`);
+        });
+      } else {
+        annotations.forEach(a => {
+          zip.file(a.file.replace('.png', '.txt'), `0 0.5 0.5 1.0 1.0`);
+        });
+      }
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `genesis_dataset_${Date.now()}.zip`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setStatus({ key: 'exported', format, count: generatedImages.length });
+    } catch {
+      setStatus({ key: 'ready' });
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const handlePush = () => {
+    if (generatedImages.length === 0) return;
     setStatus({ key: 'pushed' });
   };
+
+  const totalPages = Math.max(1, Math.ceil(generatedImages.length / ITEMS_PER_PAGE));
+  const pagedImages = generatedImages.length > 0
+    ? generatedImages.slice(resultPage * ITEMS_PER_PAGE, (resultPage + 1) * ITEMS_PER_PAGE)
+    : galleryItems;
+  const selectedImage = generatedImages.length > 0
+    ? generatedImages[resultPage * ITEMS_PER_PAGE + selectedResult]
+    : null;
 
   const handleSaveSettings = () => {
     setEpoch(defaultEpoch);
@@ -410,14 +518,12 @@ export default function App() {
             <div className="top-info">
               <span className="top-label">{t.project}</span>
               <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}>
-                <option>Box Inspection</option>
-                <option>Carpet Inspection </option>
-                <option>Ring Inspection</option>
+                {modelList.length > 0 ? modelList.map(m => <option key={m} value={m}>{m}</option>) : <option>No models</option>}
               </select>
             </div>
             <div className="divider" />
-            <div className="status-pill"><span className="status-dot" /> {t.ready} <small>v2.1</small></div>
-            <div className="top-info gpu"><span className="top-label">{t.serverGpu}</span><span><i className="ri-flashlight-line" /> {t.connected}</span></div>
+            <div className={`status-pill ${!backendConnected ? 'disconnected' : ''}`}><span className="status-dot" style={{ background: backendConnected ? '#22c55e' : '#ef4444' }} /> {backendConnected ? t.ready : 'OFFLINE'} <small>v2.1</small></div>
+            <div className="top-info gpu"><span className="top-label">{t.serverGpu}</span><span><i className="ri-flashlight-line" /> {backendConnected ? t.connected : 'DISCONNECTED'}</span></div>
           </div>
 
           <div className="top-actions">
@@ -438,7 +544,7 @@ export default function App() {
           <aside className="left-column">
             <section className="glass-panel panel-card">
               <SectionTitle title={t.baselineData} meta={`${normalFiles.length + defectFiles.length || 20} ${t.filesSuffix}`} />
-              <UploadZone label={t.normalProduct} count="12" files={normalFiles} onFiles={setNormalFiles} inputRef={normalInputRef} t={t} />
+              <UploadZone label={t.normalProduct} count="12" files={normalFiles} onFiles={handleUpload} inputRef={normalInputRef} t={t} />
               <UploadZone label={t.defectReferences} count="8" files={defectFiles} onFiles={setDefectFiles} inputRef={defectInputRef} t={t} />
               <div className="data-status"><i className="ri-checkbox-circle-fill" /> {t.baselineValidated}</div>
             </section>
@@ -490,26 +596,14 @@ export default function App() {
             </div>
 
             <div className="inspection-canvas">
-              <img src={previewImage} alt="Product preview" />
+              <img src={selectedImage ? selectedImage.image : previewImage} alt="Product preview" />
               <div className="scan-line" />
-              {showLabels && (
-                <div className="bbox">
-                  <div className="bbox-label">{selectedDefect.toUpperCase()} <b>0.97</b></div>
-                </div>
-              )}
               <div className="canvas-corner top-left">{t.livePreview}</div>
-              <div className="canvas-corner bottom-left">CAM 01 · 1920×1080</div>
-              <div className="inspection-card">
-                <div><span>{t.label}</span><strong>{selectedDefect}</strong></div>
-                <div><span>{t.boundingBox}</span><strong>x: 512 · y: 384</strong></div>
-                <div><span>{t.realismScore}</span><strong className="success-text">96%</strong></div>
-              </div>
+              <div className="canvas-corner bottom-left">{selectedImage ? `${selectedImage.model} · Job #${selectedImage.id}` : 'CAM 01 · 1920×1080'}</div>
             </div>
 
             <div className="epoch-header">
-              <button className="nav-btn" onClick={() => setEpoch(Math.max(1, epoch - 1))}><i className="ri-arrow-left-s-line" /> {t.prev}</button>
               <div className="epoch-readout"><span>{t.epoch}</span><strong>{epoch}</strong><small>/ 100</small></div>
-              <button className="nav-btn" onClick={() => setEpoch(Math.min(100, epoch + 1))}>{t.next} <i className="ri-arrow-right-s-line" /></button>
             </div>
 
             <div className="evolution-block">
@@ -525,12 +619,6 @@ export default function App() {
                 ))}
               </div>
             </div>
-
-            <div className="canvas-footer">
-              <button className="secondary-btn"><i className="ri-fire-line" /> {t.viewHeatmap}</button>
-              <button className="secondary-btn" onClick={() => setShowLabels(!showLabels)}><i className="ri-focus-3-line" /> {t.toggleLabels}</button>
-              <span className={`label-state ${showLabels ? 'on' : ''}`}><i className="ri-checkbox-blank-circle-fill" /> {t.labels} {showLabels ? t.on : t.off}</span>
-            </div>
           </section>
 
           <aside className="right-column">
@@ -538,15 +626,15 @@ export default function App() {
               <SectionTitle title={t.liveOutput} meta={`${generated.toLocaleString()} ${t.generatedSuffix}`} />
               <div className="gallery-head"><span>{t.resultGrid}</span><span>{t.page} 01 / 34</span></div>
               <div className="result-grid">
-                {galleryItems.map((item) => (
-                  <button key={item.id} className={`result-thumb ${selectedResult === item.id - 1 ? 'selected' : ''}`} onClick={() => setSelectedResult(item.id - 1)}>
+                {pagedImages.map((item, idx) => (
+                  <button key={item.id} className={`result-thumb ${selectedResult === idx ? 'selected' : ''}`} onClick={() => setSelectedResult(idx)}>
                     <img src={item.image} alt={`Generated defect ${item.id}`} />
                     <span className="thumb-box" />
-                    <span className="thumb-confidence">{item.confidence}</span>
+                    <span className="thumb-confidence">{item.model || item.confidence}</span>
                   </button>
                 ))}
               </div>
-              <div className="pagination"><span>{t.totalGenerated} <strong>{generated.toLocaleString()}</strong></span><div><button><i className="ri-arrow-left-s-line" /></button><span>1 / 34</span><button><i className="ri-arrow-right-s-line" /></button></div></div>
+              <div className="pagination"><span>{t.totalGenerated} <strong>{generated.toLocaleString()}</strong></span><div><button onClick={() => setResultPage(p => Math.max(0, p - 1))} disabled={resultPage === 0}><i className="ri-arrow-left-s-line" /></button><span>{resultPage + 1} / {totalPages}</span><button onClick={() => setResultPage(p => Math.min(totalPages - 1, p + 1))} disabled={resultPage >= totalPages - 1}><i className="ri-arrow-right-s-line" /></button></div></div>
             </section>
 
             <section className="glass-panel panel-card metrics-card">
@@ -571,8 +659,8 @@ export default function App() {
                 <i className="ri-arrow-down-s-line" />
               </div>
               <div className="dataset-summary"><span>{t.imagesWord} <b>{generated.toLocaleString()}</b></span><span>{t.annotations} <b>{generated.toLocaleString()}</b></span><span>{t.classes} <b>04</b></span></div>
-              <button className="export-btn" onClick={handleExport}><i className="ri-download-2-line" /> {t.exportDataset}</button>
-              <button className="push-btn" onClick={handlePush}><i className="ri-upload-cloud-2-line" /> {t.pushFactory}</button>
+              <button className="export-btn" onClick={handleExport} disabled={isExporting || generatedImages.length === 0}><i className={isExporting ? 'ri-loader-4-line spin' : 'ri-download-2-line'} /> {isExporting ? 'EXPORTING…' : t.exportDataset}</button>
+              <button className="push-btn" onClick={handlePush} disabled={generatedImages.length === 0}><i className="ri-upload-cloud-2-line" /> {t.pushFactory}</button>
               <div className="ready-line"><span className="status-dot" /> {message}</div>
             </section>
           </aside>
